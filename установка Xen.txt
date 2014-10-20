@@ -1,0 +1,107 @@
+#установка ОС hetzner
+installimage
+
+aptitude install bridge-utils
+uname -a
+locale
+aptitude install xen-hypervisor
+nano /etc/default/grub 
+GRUB_DEFAULT="2"
+GRUB_CMDLINE_LINUX="apparmor=0"
+GRUB_CMDLINE_XEN="dom0_mem=1G,max:1G dom0_max_vcpus=1-2"
+update-grub
+reboot
+
+apt-get install xcp-xapi (выбрать bridge)
+#создание партиций для софтверного массива, для дальнейшего использования в качестве локальных стораджей
+fdisk
+# применение изменений без ребута
+partprobe
+# создание софтверного массива
+mdadm --create --verbose /dev/md3 --level=1 --raid-device=2 /dev/sda5 /dev/sdb5
+mdadm --create --verbose /dev/md4 --level=1 --raid-device=2 /dev/sda6 /dev/sdb6
+#добавить данные о массиве в файл конфигурации /etc/mdadm/mdadm.conf
+mdadm --detail --scan
+#лучше выполнить ребут и убедиться в корректности настроек софтверного массива и в том что xapi корректно установлены и работают xe vm-list
+reboot
+
+#инициализация lvm на физических устройствах
+pvcreate /dev/md3
+pvcreate /dev/md4
+
+#создание VolumeGroup
+vgcreate VolumeGroup_iso /dev/md3
+
+#создание хранилища для ISO образов
+lvcreate -l 100%FREE -n StorageRepositoryForISO Volume_iso
+mkfs.ext4 /dev/Volume_iso/StorageRepositoryForISO
+mkdir -p /home/xen/LocalISORepository/
+mount -t ext4 /dev/Volume_iso/StorageRepositoryForISO /home/xen/LocalISORepository/
+xe sr-create name-label=LocalISORepository type=iso shared=true device-config:location=/home/xen/LocalISORepository/ device-config:legacy_mode=true content-type=iso
+#добавить строку в fstab для автоматического маунта
+/dev/mapper/VolumeGroup_iso-StorageRepositoryForISO /home/xen/LocalISORepository/ ext4 defaults 0 1
+
+#создание хранилища для ВМ
+lvcreate -l 100%FREE -n StorageRepository Volume_vms
+xe sr-create type=ext shared=true name-label="SR Linux" device-config:device=/dev/Volume_vms/StorageRepository
+
+# Можно подключиться через XenCenter к серверу и создать выделенную сеть для ВМ, которая будет через NAT смотреть наружу
+# вкладка networking,нажать на add network и выбрать single-single private network
+
+#настройки сети, файл /etc/network/interfaces
+# дефолтный бридж интерфейс для работы с Xen должен называться xenbr0
+auto eth0
+iface eth0 inet manual
+iface eth0:1 inet manual
+
+auto xenbr0
+iface xenbr0 inet static
+	address 1.1.1.2
+	netmask 255.255.255.224
+	gateway 1.1.1.1
+	up route add -net 1.1.1.0 netmask 255.255.255.224 gw 1.1.1.1 xenbr0
+	bridge_ports eth0
+	bridge_fd 0
+	bbridge_stp off
+	up /sbin/ip addr add 1.1.1.1/29 dev xenbr0 #добавление первого адреса из подсети 1.1.1.1/29 для назначения адресов из данной подсети для ВМ
+	up iptables-restore < /etc/network/iptables.rules
+
+auto xapi0
+iface xapi0 inet static
+	address 192.168.100.1
+	netmask 255.255.255.0
+	bridge_ports eth0:1
+	bridge_fd 0
+	bridge_stp off
+#настройки iptables
+#необходимо добавить
+iptables -A POSTROUTING -o xapi0 -j MASQUERADE
+iptables -A POSTROUTING -o xenbr0 -j MASQUERADE
+#а так же параметры ядра, добавить в /etc/sysctl.conf
+
+net.bridge.bridge-nf-call-ip6tables = 0
+net.bridge.bridge-nf-call-iptables = 0
+net.bridge.bridge-nf-call-arptables = 0
+net.ipv4.ip_forward = 1
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.default.send_redirects=0
+net.ipv4.conf.lo.send_redirects=0
+net.ipv4.conf.xenbr0.send_redirects=0
+net.ipv4.conf.xenbr0.proxy_arp = 1
+net.ipv4.conf.eth0.proxy_arp = 1
+net.ipv6.conf.all.disable_ipv6 = 1
+#применить без ребута
+sysctl -p /etc/sysctl.conf
+
+#после указанных действий можно устанавливать ВМ и в зависимости от настроек внутри ОС, они будут иметь в ту или иную сеть, или обе сразу
+
+#установка OpenVPN Access Server
+#необходимо скачать пакет для той ОС на которой будет разворачивать сервер с http://openvpn.net/index.php/access-server/download-openvpn-as-sw.html
+#установка для debian 
+dpkg -i openvpnasdebpack.deb
+#сменить дефолтный пароль админского пользователя
+passwd openvpn
+#после этого можно зайти в админку по адресу https://ip-сервера/admin и залогиниться пользователем openvpn
+
+
+
